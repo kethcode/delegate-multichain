@@ -5,7 +5,7 @@ import {IDelegationRegistry} from "./IDelegationRegistry.sol";
 import {EnumerableSet} from "openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol";
 import {ERC165} from "openzeppelin-contracts/contracts/utils/introspection/ERC165.sol";
 
-// adding a comment
+import {NonblockingLzApp} from "lib/solidity-examples/contracts/lzApp/NonblockingLzApp.sol";
 
 /**
  * @title DelegationRegistry
@@ -26,9 +26,10 @@ import {ERC165} from "openzeppelin-contracts/contracts/utils/introspection/ERC16
  * @custom:coauthor john (gnosis safe)
  * @custom:coauthor 0xrusowsky
  */
-contract DelegationRegistry is IDelegationRegistry, ERC165 {
+contract DelegationRegistry is IDelegationRegistry, ERC165, NonblockingLzApp {
     using EnumerableSet for EnumerableSet.AddressSet;
     using EnumerableSet for EnumerableSet.Bytes32Set;
+    using EnumerableSet for EnumerableSet.UintSet;
 
     /// @notice The global mapping and single source of truth for delegations
     /// @dev vault -> vaultVersion -> delegationHash
@@ -50,6 +51,33 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
     mapping(bytes32 => IDelegationRegistry.DelegationInfo)
         internal delegationInfo;
 
+    /// @notice A mapping of EVM IDs to their LZ chaindId
+    /// @dev testnet reference: https://layerzero.gitbook.io/docs/technical-reference/testnet/testnet-addresses
+    /// @dev mainnet reference: https://layerzero.gitbook.io/docs/technical-reference/mainnet/supported-chain-ids
+    mapping(uint256 => uint16) internal evmIdToLzChainId;
+
+    /// @notice an enumeration of all supported chains.
+    EnumerableSet.UintSet internal supportedChains;
+
+    // Payload structure
+    // delegate, delegateHash, value, type_, vault, contract_, tokenId
+    // delegate [0x00:0x20]
+    // delegateHash [0x20:0x40]
+    // value [0x40:0x41]
+    // type_ [0x41:0x42]
+    // vault [0x42:0x62]
+    // contract_ [0x62:0x82]
+    // tokenId [0x82:0xa2]
+    bytes private DEFAULT_PAYLOAD;
+
+    ///
+    /// @param _lzEndpoint The address of the immutable LZ Endpoint for this chain
+    ///
+    constructor(address _lzEndpoint) NonblockingLzApp(_lzEndpoint) {
+        // TODO: I hate this.
+        DEFAULT_PAYLOAD = new bytes(0xa2);
+    }
+
     /**
      * @inheritdoc ERC165
      */
@@ -68,7 +96,10 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
     /**
      * @inheritdoc IDelegationRegistry
      */
-    function delegateForAll(address delegate, bool value) external override {
+    function delegateForAll(
+        address delegate,
+        bool value
+    ) external payable override {
         bytes32 delegationHash = _computeAllDelegationHash(
             msg.sender,
             delegate
@@ -149,6 +180,52 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
     }
 
     /**
+     * @notice receive incoming delegation update from another chain
+     * @param _payload - the signed payload is the UA bytes has encoded to be sent
+     */
+    function _nonblockingLzReceive(
+        uint16,
+        bytes memory,
+        uint64,
+        bytes memory _payload
+    ) internal override {
+        address delegate;
+        bytes32 delegateHash;
+        bool value;
+        IDelegationRegistry.DelegationType type_;
+        address vault;
+        address contract_;
+        uint256 tokenId;
+
+        // payload is packed delegate data
+        // TODO: we could save gas by using encodePacked, but then we need a custom decoder
+        (delegate, delegateHash, value, type_, vault, contract_, tokenId) = abi
+            .decode(
+                _payload,
+                (
+                    address,
+                    bytes32,
+                    bool,
+                    IDelegationRegistry.DelegationType,
+                    address,
+                    address,
+                    uint256
+                )
+            );
+
+        _setDelegationValues(
+            delegate,
+            delegateHash,
+            value,
+            IDelegationRegistry.DelegationType.ALL,
+            msg.sender,
+            address(0),
+            0
+        );
+        emit IDelegationRegistry.DelegateForAll(msg.sender, delegate, value);
+    }
+
+    /**
      * @dev Helper function to set all delegation values and enumeration sets
      */
     function _setDelegationValues(
@@ -160,6 +237,10 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
         address contract_,
         uint256 tokenId
     ) internal {
+        require(
+            msg.value >= estimateFee(),
+            "DelegationRegistry: insufficient fee"
+        );
         if (value) {
             delegations[vault][vaultVersion[vault]].add(delegateHash);
             delegationHashes[delegate].add(delegateHash);
@@ -174,6 +255,48 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
             delegations[vault][vaultVersion[vault]].remove(delegateHash);
             delegationHashes[delegate].remove(delegateHash);
             delete delegationInfo[delegateHash];
+        }
+
+        // destination cache;
+        uint16 dstChainId;
+
+        // loop through each EVMID that is not this one
+        // TODO: I would prefer this in a multicall so we could revert on an error on any endpoint call
+        for (uint256 i = 0; i < EnumerableSet.length(supportedChains); i++) {
+            // retrieve the Lz chaindId
+            dstChainId = evmIdToLzChainId[EnumerableSet.at(supportedChains, i)];
+
+            // don't replicate to self
+            if (dstChainId == block.chainid) {
+                continue;
+            }
+
+            // if destination chain is not configured, skip
+            if (dstChainId == 0) {
+                continue;
+            }
+
+            // payload is packed delegate data
+            // TODO: we could save gas by using encodePacked, but then we need a custom decoder
+            bytes memory payload = abi.encode(
+                delegate,
+                delegateHash,
+                value,
+                type_,
+                vault,
+                contract_,
+                tokenId
+            );
+
+            // send the message
+            _lzSend(
+                dstChainId,
+                payload,
+                payable(msg.sender),
+                address(0x0),
+                bytes(""),
+                msg.value
+            );
         }
     }
 
@@ -267,6 +390,17 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
         ++delegateVersion[vault][delegate];
         // For enumerations, filter in the view functions
         emit IDelegationRegistry.RevokeDelegate(vault, msg.sender);
+    }
+
+    function manageLZChains(uint256 evmId, uint16 lzChainId) external {
+        require(msg.sender == this.owner(), "DelegationRegistry: only owner");
+        if (lzChainId != 0) {
+            evmIdToLzChainId[evmId] = lzChainId;
+            supportedChains.add(evmId);
+        } else {
+            evmIdToLzChainId[evmId] = 0;
+            supportedChains.remove(evmId);
+        }
     }
 
     /**
@@ -653,5 +787,52 @@ contract DelegationRegistry is IDelegationRegistry, ERC165 {
             delegations[vault][vaultVersion[vault]].contains(delegateHash)
                 ? true
                 : checkDelegateForContract(delegate, vault, contract_);
+    }
+
+    function estimateFee() public view returns (uint nativeFee) {
+        // fee cache
+        uint256 nativeFeeTemp;
+        uint256 zroFeeTemp;
+
+        // destination cache;
+        uint16 dstChainId;
+
+        // loop through each EVMID that is not this one
+        for (uint256 i = 0; i < EnumerableSet.length(supportedChains); i++) {
+            // retrieve the Lz chaindId
+            dstChainId = evmIdToLzChainId[EnumerableSet.at(supportedChains, i)];
+
+            // don't replicate to self
+            if (dstChainId == block.chainid) {
+                continue;
+            }
+
+            // if destination chain is not configured, skip
+            if (dstChainId == 0) {
+                continue;
+            }
+
+            (nativeFeeTemp, zroFeeTemp) = lzEndpoint.estimateFees(
+                dstChainId,
+                address(this),
+                DEFAULT_PAYLOAD,
+                false,
+                new bytes(0)
+            );
+
+            nativeFee += nativeFeeTemp;
+        }
+
+        return nativeFee;
+    }
+
+    function getSupportedChains() external view returns (uint256[] memory) {
+        uint256[] memory evmIds = new uint256[](
+            EnumerableSet.length(supportedChains)
+        );
+        for (uint256 i = 0; i < EnumerableSet.length(supportedChains); i++) {
+            evmIds[i] = EnumerableSet.at(supportedChains, i);
+        }
+        return evmIds;
     }
 }

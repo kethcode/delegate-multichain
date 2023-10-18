@@ -6,11 +6,61 @@ import {console2} from "forge-std/console2.sol";
 import {DelegationRegistry} from "src/DelegationRegistry.sol";
 import {IDelegationRegistry} from "src/IDelegationRegistry.sol";
 
+import {LZEndpointMock} from "@layerzero-contracts/lzApp/mocks/LZEndpointMock.sol";
+
 contract DelegationRegistryTest is Test {
     DelegationRegistry reg;
+    DelegationRegistry reg_remote;
+
+    LZEndpointMock public lzEndpointMock;
+
+    address DEPLOYER = makeAddr("deployer");
+    address USER1 = makeAddr("user1");
+
+    uint256 constant ETH_EVMID = 1;
+    uint256 constant OPTIMISM_EVMID = 10;
+    uint256 constant BSC_EVMID = 56;
+    uint256 constant POLYGON_EVMID = 137;
+    uint256 constant ARBITRUM_EVMID = 42161;
+
+    uint16 constant CHAINID_MOCK = 1128;
+
+    uint256 constant CONTRACT_STARTING_BALANCE = 1 ether;
+    uint256 constant USER_STARTING_BALANCE = 10 ether;
 
     function setUp() public {
-        reg = new DelegationRegistry();
+        vm.startPrank(DEPLOYER);
+        // deploy mock endpoint
+        lzEndpointMock = new LZEndpointMock(CHAINID_MOCK);
+
+        // deploy registries
+        reg = new DelegationRegistry(address(lzEndpointMock));
+        reg_remote = new DelegationRegistry(address(lzEndpointMock));
+
+        vm.deal(DEPLOYER, USER_STARTING_BALANCE);
+        vm.deal(USER1, USER_STARTING_BALANCE);
+
+        vm.deal(address(lzEndpointMock), CONTRACT_STARTING_BALANCE);
+        vm.deal(address(reg), CONTRACT_STARTING_BALANCE);
+        vm.deal(address(reg_remote), CONTRACT_STARTING_BALANCE);
+
+        // set up addresses that are allowed to send LZ calls to these contracts
+        reg.setTrustedRemoteAddress(CHAINID_MOCK, abi.encodePacked(uint160(address(reg_remote))));
+
+        reg_remote.setTrustedRemoteAddress(CHAINID_MOCK, abi.encodePacked(uint160(address(reg))));
+
+        // Set up mock routing
+        lzEndpointMock.setDestLzEndpoint(address(reg), address(lzEndpointMock));
+        lzEndpointMock.setDestLzEndpoint(address(reg_remote), address(lzEndpointMock));
+
+        // configure multichain propogation for both registries (to mock LZ Chain)
+        reg.manageLZChains(ETH_EVMID, CHAINID_MOCK);
+        reg_remote.manageLZChains(OPTIMISM_EVMID, CHAINID_MOCK);
+
+        // get default_fee for current chain configuration
+        uint256 default_fee = reg.estimateFee();
+
+        vm.stopPrank();
     }
 
     function getInitHash() public pure returns (bytes32) {
@@ -23,16 +73,38 @@ contract DelegationRegistryTest is Test {
         emit log_bytes32(initHash);
     }
 
+    function testEstimateFee() public view {
+        uint256 fee = reg.estimateFee();
+        console2.log(fee);
+        assert(fee > 21000);
+    }
+
     function testApproveAndRevokeForAll(address vault, address delegate) public {
+        vm.deal(vault, USER_STARTING_BALANCE);
+
         // Approve
         vm.startPrank(vault);
-        reg.delegateForAll(delegate, true);
+        uint256 fee = (reg.estimateFee() * 11) / 10;
+        reg.delegateForAll{value: fee}(delegate, true);
+
+        // assert delegations have been set
         assertTrue(reg.checkDelegateForAll(delegate, vault));
         assertTrue(reg.checkDelegateForContract(delegate, vault, address(0x0)));
         assertTrue(reg.checkDelegateForToken(delegate, vault, address(0x0), 0));
+
+        // assert delegations have been propogated to remote registry
+        assertTrue(reg_remote.checkDelegateForAll(delegate, vault));
+        assertTrue(reg_remote.checkDelegateForContract(delegate, vault, address(0x0)));
+        assertTrue(reg_remote.checkDelegateForToken(delegate, vault, address(0x0), 0));
+
         // Revoke
-        reg.delegateForAll(delegate, false);
+        reg.delegateForAll{value: fee}(delegate, false);
+
+        // assert delegations have been revoked
         assertFalse(reg.checkDelegateForAll(delegate, vault));
+
+        // assert delegation revokation has been propogated
+        assertFalse(reg_remote.checkDelegateForAll(delegate, vault));
     }
 
     function testApproveAndRevokeForContract(address vault, address delegate, address contract_) public {

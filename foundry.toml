@@ -4,4 +4,10 @@ out = 'out'
 libs = ['lib']
 solc_version = "0.8.17"
 
+# needed to resolve lzApp imports, since they assume hardhat i guess
+remappings = [
+    "@layerzero-contracts/=lib/solidity-examples/contracts/",
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+]
+
 # See more config options https://github.com/foundry-rs/foundry/tree/master/config

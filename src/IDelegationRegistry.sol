@@ -61,7 +61,7 @@ interface IDelegationRegistry {
      * @param delegate The hotwallet to act on your behalf
      * @param value Whether to enable or disable delegation for this address, true for setting and false for revoking
      */
-    function delegateForAll(address delegate, bool value) external;
+    function delegateForAll(address delegate, bool value) external payable;
 
     /**
      * @notice Allow the delegate to act on your behalf for a specific contract
